@@ -1,0 +1,100 @@
+```gitignore
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.mypy_cache/
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite3
+database/migrations/versions/*.py
+
+# ML Models
+models/saved_models/
+models/checkpoints/
+models/experiments/*
+!models/experiments/.gitkeep
+
+# Data
+data/historical/
+data/cache/
+data/exports/
+*.csv
+*.parquet
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/*.ipynb
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Frontend
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+frontend/.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Temp files
+*.tmp
+*.bak
+*.swp
+temp/
+
+# Secrets
+*.pem
+*.key
+secrets/
+```
+
+---

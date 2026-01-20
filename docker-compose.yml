@@ -1,0 +1,378 @@
+services:
+  # ============================================================================
+  # DATABASE SERVICES
+  # ============================================================================
+
+  # PostgreSQL - Main database for trades, accounts, analytics
+  postgres:
+    image: postgres:14-alpine
+    container_name: ict_postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_INITDB_ARGS: "-E UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      # Persist data even when container stops
+      - postgres_data:/var/lib/postgresql/data
+      # Custom initialization scripts
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - ict_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis - Cache and real-time data streaming
+  redis:
+    image: redis:7-alpine
+    container_name: ict_redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ict_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ============================================================================
+  # APPLICATION SERVICES
+  # ============================================================================
+
+  # Backend API - FastAPI REST API
+  backend:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.backend
+      args:
+        PYTHON_VERSION: 3.11
+    container_name: ict_backend
+    command: >
+      sh -c "
+        alembic upgrade head &&
+        uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+      "
+    ports:
+      - "8000:8000"
+    environment:
+      # Database
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      # Redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      # MT5
+      - MT5_LOGIN=${MT5_LOGIN}
+      - MT5_PASSWORD=${MT5_PASSWORD}
+      - MT5_SERVER=${MT5_SERVER}
+      # App config
+      - APP_ENV=development
+      - DEBUG=True
+      - LOG_LEVEL=INFO
+      # ML
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    volumes:
+      # Live code reload during development
+      - ./src:/app/src
+      - ./config:/app/config
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ict_network
+    restart: unless-stopped
+
+  # Data Streamer - Real-time MT5 data streaming service
+  data_streamer:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.backend
+    container_name: ict_data_streamer
+    command: python -m src.data.real_time_streamer
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - REDIS_HOST=redis
+      - MT5_LOGIN=${MT5_LOGIN}
+      - MT5_PASSWORD=${MT5_PASSWORD}
+      - MT5_SERVER=${MT5_SERVER}
+    volumes:
+      - ./src:/app/src
+      - ./logs:/app/logs
+    depends_on:
+      - postgres
+      - redis
+      - backend
+    networks:
+      - ict_network
+    restart: unless-stopped
+
+  # Strategy Engine - Trade decision and execution engine
+  strategy_engine:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.backend
+    container_name: ict_strategy_engine
+    command: python -m src.strategy.decision_engine
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - REDIS_HOST=redis
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - TRADING_ENABLED=${TRADING_ENABLED:-false}
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config
+      - ./models:/app/models
+      - ./logs:/app/logs
+    depends_on:
+      - backend
+      - ml_inference
+    networks:
+      - ict_network
+    restart: unless-stopped
+
+  # ============================================================================
+  # MACHINE LEARNING SERVICES
+  # ============================================================================
+
+  # ML Training Service - Model training and optimization
+  ml_trainer:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.ml
+    container_name: ict_ml_trainer
+    command: python scripts/train_models.py --watch
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ./src:/app/src
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./notebooks:/app/notebooks
+      - ./scripts:/app/scripts
+    depends_on:
+      - postgres
+      - mlflow
+    networks:
+      - ict_network
+    # Only for GPU servers
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # ML Inference Service - Real-time model predictions
+  ml_inference:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.ml
+    container_name: ict_ml_inference
+    command: python -m src.ml.inference.predictor
+    environment:
+      - REDIS_HOST=redis
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MODEL_VERSION=latest
+    volumes:
+      - ./src:/app/src
+      - ./models:/app/models
+    depends_on:
+      - redis
+      - mlflow
+    networks:
+      - ict_network
+    restart: unless-stopped
+
+  # MLflow - Experiment tracking and model registry
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.2
+    container_name: ict_mlflow
+    ports:
+      - "5000:5000"
+    command: >
+      mlflow server 
+      --host 0.0.0.0 
+      --port 5000 
+      --backend-store-uri postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/mlflow
+      --default-artifact-root /mlflow/artifacts
+    environment:
+      - MLFLOW_S3_ENDPOINT_URL=${S3_ENDPOINT_URL}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - mlflow_data:/mlflow
+    depends_on:
+      - postgres
+    networks:
+      - ict_network
+    restart: unless-stopped
+
+  # ============================================================================
+  # FRONTEND SERVICE
+  # ============================================================================
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../deployment/docker/Dockerfile.frontend
+    container_name: ict_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_WS_URL=ws://localhost:8000/ws
+      - NODE_ENV=development
+    volumes:
+      # Live reload during development
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      # Exclude node_modules from volume
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - ict_network
+    restart: unless-stopped
+
+  # ============================================================================
+  # MONITORING & OBSERVABILITY
+  # ============================================================================
+
+  # Prometheus - Metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ict_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deployment/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - ict_network
+    restart: unless-stopped
+
+  # Grafana - Metrics visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ict_grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deployment/monitoring/grafana-dashboards:/etc/grafana/provisioning/dashboards
+      - ./deployment/monitoring/grafana-datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - ict_network
+    restart: unless-stopped
+
+  # ============================================================================
+  # MESSAGE QUEUE (Optional but recommended)
+  # ============================================================================
+
+  # Kafka - Event streaming platform
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: ict_kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+    networks:
+      - ict_network
+    restart: unless-stopped
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: ict_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - ict_network
+    restart: unless-stopped
+
+  # ============================================================================
+  # UTILITIES
+  # ============================================================================
+
+  # PgAdmin - Database management UI
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: ict_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@ict-bot.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - postgres
+    networks:
+      - ict_network
+    restart: unless-stopped
+
+# ============================================================================
+# VOLUMES - Persistent data storage
+# ============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  mlflow_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+# ============================================================================
+# NETWORKS - Container communication
+# ============================================================================
+networks:
+  ict_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
